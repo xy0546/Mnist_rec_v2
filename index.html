@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MNIST 手写数字识别</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { user-select: none; }
+        .video-wrap {
+            position: relative;
+            display: inline-block;
+        }
+        #video, #canvas {
+            width: 240px;
+            height: 180px;
+            border-radius: 0.5rem;
+        }
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+        .pre-view { border: 2px solid #2563eb; }
+    </style>
+</head>
+<body class="bg-slate-100 min-h-screen flex flex-col items-center py-4 px-2">
+    <h1 class="text-xl font-bold text-blue-700 mb-3 text-center">MNIST 手写数字识别</h1>
+
+    <div class="flex flex-col items-center gap-4 max-w-md w-full">
+        <div class="bg-white rounded-2xl shadow-xl p-3">
+            <h2 class="text-sm font-semibold text-gray-700 text-center mb-1">摄像头</h2>
+            <div class="video-wrap">
+                <video id="video" autoplay muted playsinline></video>
+                <canvas id="canvas"></canvas>
+            </div>
+            <p class="text-xs text-orange-600 mt-2 text-center">在黄色方框内写数字</p>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow-xl p-3 w-full">
+            <h2 class="text-sm font-semibold text-gray-700 text-center mb-2">识别结果</h2>
+            <div class="text-6xl font-bold text-blue-600 text-center my-2" id="predResult">--</div>
+        </div>
+
+        <div class="flex gap-3 w-full px-2">
+            <button id="openBtn" class="flex-1 bg-green-500 hover:bg-green-600 text-white py-2 rounded-lg transition text-sm">
+                打开摄像头
+            </button>
+            <button id="closeBtn" class="flex-1 bg-red-500 hover:bg-red-600 text-white py-2 rounded-lg transition text-sm">
+                关闭摄像头
+            </button>
+        </div>
+
+        <p class="text-xs text-gray-500 mt-2 text-center">模型输入预览</p>
+        <canvas id="previewCanvas" width="84" height="84" class="pre-view mx-auto mt-1"></canvas>
+
+        <div class="mt-2 bg-slate-50 p-2 rounded text-xs text-gray-700 w-full" id="logitsText">
+            正在加载模型，请稍候...
+        </div>
+    </div>
+
+    <p class="mt-4 text-gray-400 text-xs text-center">PyTorch → ONNX 前端推理</p>
+
+    <!-- 本地加载 onnxruntime-web，不再用外网CDN -->
+    <script src="./ort.min.js"></script>
+    <script>
+        let ortSession = null;
+        let videoEl, canvasEl, ctxEl, previewEl, preCtx;
+        let mediaStream = null;
+        let isBusy = false;
+        const TARGET_SIZE = 28;
+        const ROI_SIZE = 100;
+        const MODEL_PATH = "./mnist_dnn.onnx";
+
+        window.onload = async function () {
+            videoEl = document.getElementById('video');
+            canvasEl = document.getElementById('canvas');
+            previewEl = document.getElementById('previewCanvas');
+            preCtx = previewEl.getContext('2d');
+            ctxEl = canvasEl.getContext('2d');
+
+            videoEl.width = 240;
+            videoEl.height = 180;
+            canvasEl.width = 240;
+            canvasEl.height = 180;
+
+            document.getElementById('openBtn').addEventListener('click', openCamera);
+            document.getElementById('closeBtn').addEventListener('click', closeCamera);
+
+            // 异步加载模型 + 超时/异常捕获
+            loadModel();
+        };
+
+        async function loadModel() {
+            try {
+                // HTTPS 环境优先 WASM，兼容所有浏览器
+                const opt = {
+                    executionProviders: ['wasm'],
+                    graphOptimizationLevel: 'all'
+                };
+                ortSession = await ort.InferenceSession.create(MODEL_PATH, opt);
+                document.getElementById('logitsText').innerText = "✅ 模型加载完成，点击打开摄像头";
+            } catch (err) {
+                document.getElementById('logitsText').innerText = "❌ 模型加载失败，请检查文件或刷新重试";
+                console.error("模型加载错误：", err);
+            }
+        }
+
+        async function openCamera() {
+            if (mediaStream) return;
+            if (!ortSession) {
+                alert("请等待模型加载完成！");
+                return;
+            }
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 240 },
+                        height: { ideal: 180 },
+                        facingMode: "environment"
+                    }
+                });
+                videoEl.srcObject = mediaStream;
+                frameLoop();
+            } catch (err) {
+                alert("摄像头授权失败，请允许相机权限");
+                console.error(err);
+            }
+        }
+
+        function closeCamera() {
+            if (!mediaStream) return;
+            mediaStream.getTracks().forEach(track => track.stop());
+            mediaStream = null;
+            document.getElementById('predResult').innerText = '--';
+            document.getElementById('logitsText').innerText = "摄像头已关闭";
+            ctxEl.clearRect(0, 0, canvasEl.width, canvasEl.height);
+        }
+
+        function drawSingleRoiRect() {
+            const w = canvasEl.width;
+            const h = canvasEl.height;
+            const sx = (w - ROI_SIZE) / 2;
+            const sy = (h - ROI_SIZE) / 2;
+            ctxEl.clearRect(0, 0, w, h);
+            ctxEl.drawImage(videoEl, 0, 0, w, h);
+            ctxEl.strokeStyle = "#f59e0b";
+            ctxEl.lineWidth = 3;
+            ctxEl.strokeRect(sx, sy, ROI_SIZE, ROI_SIZE);
+        }
+
+        function preprocess() {
+            const w = canvasEl.width;
+            const h = canvasEl.height;
+            const sx = (w - ROI_SIZE) / 2;
+            const sy = (h - ROI_SIZE) / 2;
+            let imgData = ctxEl.getImageData(sx, sy, ROI_SIZE, ROI_SIZE);
+            const data = imgData.data;
+
+            for (let i = 0; i < data.length; i += 4) {
+                let gray = (data[i] + data[i+1] + data[i+2]) / 3;
+                gray = 255 - gray;
+                data[i] = gray;
+                data[i+1] = gray;
+                data[i+2] = gray;
+            }
+
+            const threshold = 120;
+            for (let i = 0; i < data.length; i += 4) {
+                let val = data[i] > threshold ? 255 : 0;
+                data[i] = val;
+                data[i+1] = val;
+                data[i+2] = val;
+            }
+
+            let minX = ROI_SIZE, maxX = 0, minY = ROI_SIZE, maxY = 0;
+            for (let y = 0; y < ROI_SIZE; y++) {
+                for (let x = 0; x < ROI_SIZE; x++) {
+                    const idx = (y * ROI_SIZE + x) * 4;
+                    if (data[idx] > 0) {
+                        minX = Math.min(minX, x);
+                        maxX = Math.max(maxX, x);
+                        minY = Math.min(minY, y);
+                        maxY = Math.max(maxY, y);
+                    }
+                }
+            }
+            if (minX > maxX || minY > maxY) {
+                minX = ROI_SIZE/2 - 30; maxX = ROI_SIZE/2 + 30;
+                minY = ROI_SIZE/2 - 30; maxY = ROI_SIZE/2 + 30;
+            }
+
+            let cropW = maxX - minX;
+            let cropH = maxY - minY;
+            let side = Math.max(cropW, cropH);
+            const cropCanvas = document.createElement('canvas');
+            cropCanvas.width = side;
+            cropCanvas.height = side;
+            const cropCtx = cropCanvas.getContext('2d');
+            cropCtx.fillStyle = "#000";
+            cropCtx.fillRect(0,0,side,side);
+            cropCtx.putImageData(imgData, -minX + (side - cropW)/2, -minY + (side - cropH)/2);
+
+            const targetCanvas = document.createElement('canvas');
+            targetCanvas.width = TARGET_SIZE;
+            targetCanvas.height = TARGET_SIZE;
+            const tCtx = targetCanvas.getContext('2d');
+            tCtx.drawImage(cropCanvas, 0, 0, TARGET_SIZE, TARGET_SIZE);
+
+            preCtx.clearRect(0,0,previewEl.width,previewEl.height);
+            preCtx.drawImage(targetCanvas, 0, 0, previewEl.width, previewEl.height);
+
+            const finalData = tCtx.getImageData(0,0,TARGET_SIZE,TARGET_SIZE).data;
+            const floatData = [];
+            const mean = 0.1307;
+            const std = 0.3081;
+            for (let i = 0; i < finalData.length; i += 4) {
+                let pix = finalData[i] / 255.0;
+                pix = (pix - mean) / std;
+                floatData.push(pix);
+            }
+
+            return new ort.Tensor('float32', floatData, [1, 1, TARGET_SIZE, TARGET_SIZE]);
+        }
+
+        async function frameLoop() {
+            if (!mediaStream || isBusy) {
+                setTimeout(frameLoop, 120);
+                return;
+            }
+            isBusy = true;
+            drawSingleRoiRect();
+
+            try {
+                const input = preprocess();
+                const output = await ortSession.run({ input });
+                const logits = output.output.data;
+                const pred = logits.indexOf(Math.max(...logits));
+                document.getElementById('predResult').innerText = pred;
+                document.getElementById('logitsText').innerText = logits.map(v => v.toFixed(2)).join(', ');
+            } catch (e) {
+                console.error(e);
+            }
+
+            isBusy = false;
+            setTimeout(frameLoop, 120);
+        }
+    </script>
+</body>
+</html>
